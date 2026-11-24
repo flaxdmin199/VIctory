@@ -642,7 +642,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !heap.samplers() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }

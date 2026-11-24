@@ -787,4 +787,37 @@ mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
+
+    /// A shader-visible sampler heap larger than 2048 gets a capped host heap on first use.
+    #[test]
+    fn sampler_heap_larger_than_2048_creates_host_heap() {
+        let desc = HeapDesc {
+            kind: 1, // SAMPLERS
+            count: 4096,
+            flags: 1, // SHADER_VISIBLE
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address: 0,
+                    size: 0,
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let heap = heap(h);
+        #[cfg(windows)]
+        {
+            if crate::host::host().is_some() {
+                let host = heap
+                    .host()
+                    .expect("host heap should be created for sampler heap > 2048");
+                assert_eq!(host.count(), 2048);
+            }
+        }
+    }
 }

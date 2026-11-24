@@ -59,6 +59,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The host's limit for shader-visible sampler heaps across all binding tiers.
+const PORTABLE_SAMPLERS: u32 = 2048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -85,17 +88,25 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        let requested = count + extra;
+        let (heap, count) = if sampler && requested > PORTABLE_SAMPLERS {
+            // shortcut: descriptors past the host's limit are left out;
+            // a title that reaches them needs remapping.
+            tracing::warn!(count, "host sampler heap capped at {PORTABLE_SAMPLERS}");
+            (make(PORTABLE_SAMPLERS).ok()?, PORTABLE_SAMPLERS - extra)
+        } else {
+            match make(requested) {
+                Ok(heap) => (heap, count),
+                Err(e) if !sampler && requested > PORTABLE_VIEWS => {
+                    // shortcut: descriptors past the host's limit are left out;
+                    // a title that reaches them needs remapping.
+                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         // SAFETY: a live heap.
@@ -141,12 +152,16 @@ impl HostHeap {
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
         let Some(host) = host() else { return Ok(()) };
+        let block_size = BLOCK.min(total);
+        if block_size == 0 {
+            return Ok(());
+        }
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_size,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -159,14 +174,14 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_size {
+                let n = filled.min(block_size - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_size.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
@@ -949,5 +964,19 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// A sampler heap larger than 2048 descriptors is capped at 2048 and created.
+    #[test]
+    fn sampler_heap_larger_than_2048_is_capped() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let heap = HostHeap::new(true, 4096);
+        let heap = heap.expect("sampler heap capped at 2048 should be created");
+        assert_eq!(heap.count(), 2048);
+        assert!(heap.sampler);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
