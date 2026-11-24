@@ -243,7 +243,18 @@ impl Shadow {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+                    // Only mark current if title memory still matches the host
+                    // copy; a title write between its piece merge and the reset
+                    // leaves it stale so the next refresh copies it.
+                    // SAFETY: within the host mapping of the buffer; whole page in bounds.
+                    let host = unsafe {
+                        std::slice::from_raw_parts(self.data.add(page * PAGE - start), PAGE)
+                    };
+                    if crate::host::read_into((page * PAGE) as *const u8, &mut title)
+                        && title.as_slice() == host
+                    {
+                        copied[page - base] = now;
+                    }
                 }
             }
         }
@@ -496,4 +507,98 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const PAGES: usize = 64;
+
+    /// Write-watched title memory of `PAGES` pages, freed on drop.
+    struct Title(usize);
+    impl Title {
+        fn new() -> Title {
+            // SAFETY: a fresh allocation, freed on drop.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    PAGES * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(p, 0);
+            Title(p)
+        }
+    }
+    impl Drop for Title {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A host copy of the title memory, brought up to date, with shaders of
+    /// the submission declared to write all of it and byte 0 of every page
+    /// written by "the GPU".
+    fn submitted(base: usize) -> Option<Shadow> {
+        let (buffer, data) = host()?.shared_buffer((PAGES * PAGE) as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let s = Shadow::new(buffer, data, gpu, base as u64, (PAGES * PAGE) as u64);
+        assert_eq!(s.update(base, PAGES * PAGE), PAGES * PAGE);
+        s.writing(base, PAGES * PAGE);
+        for p in 0..PAGES {
+            // SAFETY: inside the copy.
+            unsafe { s.data.add(p * PAGE).write(1) };
+        }
+        Some(s)
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: the tests pass addresses inside their memory.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// The title writes a page once the copy-back has put the shader's
+    /// byte there (its read of the page is done), while later pages are
+    /// still being copied back: the next refresh brings the write in.
+    #[test]
+    fn a_title_write_during_copy_back_reaches_the_copy() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return; // no host GPU here
+        };
+        std::thread::scope(|t| {
+            t.spawn(|| {
+                while peek(base + PAGE) != 1 {
+                    std::hint::spin_loop();
+                }
+                // SAFETY: inside the title memory.
+                unsafe { ((base + 8) as *mut u8).write_volatile(7) };
+            });
+            s.copy_back(base, PAGES * PAGE);
+        });
+        assert_eq!(peek(base + 8), 7, "in title memory");
+        s.update(base, PAGE);
+        assert_eq!(peek(s.data as usize + 8), 7, "in the copy");
+    }
+
+    /// When the title does not write during copy-back, synced pages are
+    /// marked current and a subsequent update copies 0 bytes.
+    #[test]
+    fn copy_back_marks_synced_pages_current_when_title_is_unchanged() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return; // no host GPU here
+        };
+        s.copy_back(base, PAGES * PAGE);
+        assert_eq!(s.update(base, PAGES * PAGE), 0);
+    }
 }
